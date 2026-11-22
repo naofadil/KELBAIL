@@ -92,6 +92,7 @@ export default function EventDetail() {
   const purchase = useMutation({
     mutationFn: (d) => api.ops.purchase({
       eventId: id, quantity: d.quantity, buyerName: d.buyerName, operator: d.operator, ussdCode: d.ussdCode,
+      paymentMethod: d.paymentMethod, paymentToken: d.paymentToken,
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['event', id] })

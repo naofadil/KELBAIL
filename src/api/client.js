@@ -30,6 +30,24 @@ const COLLECTIONS = [
 /** Champs d'un compte qui ne doivent jamais sortir de la couche de données. */
 const SECRET_USER_FIELDS = ['password_hash', 'salt', 'iterations']
 
+/**
+ * Collections dont la modification/suppression ne doit JAMAIS passer par la
+ * voie publique `entities.X.update/delete` — uniquement par le code interne
+ * de `ops`/`auth`/`functions`, qui passe alors `trusted = true`.
+ *
+ * Sans cette liste, n'importe quel script important `api` (même non connecté)
+ * pouvait appeler `entities.User.update(unId, { role: 'admin' })` et se
+ * promouvoir administrateur, ou `entities.Ticket.update(unBillet, { status:
+ * 'confirme' })` pour valider un billet jamais payé : la couche générique
+ * n'appliquait aucun des contrôles que `ops`/`auth` imposent par ailleurs.
+ */
+const LOCKED_COLLECTIONS = new Set(['User', 'Ticket', 'Event', 'Payout', 'FraudReport', 'StaffMember'])
+
+/** Pour les collections non verrouillées, champs que seule la voie interne peut modifier. */
+const PROTECTED_FIELDS = {
+  Organizer: ['status', 'is_verified', 'rating', 'total_events'],
+}
+
 /** Plafond de billets par personne et par événement. */
 export const MAX_TICKETS_PER_PERSON = 10
 
@@ -135,12 +153,33 @@ function entity(name) {
       load()
       return out(db[name].find((i) => i.id === id) || null)
     },
-    async create(data) {
+    async create(data, _trusted = false) {
       load()
+      // Un membre du staff ne peut être créé que par l'organisateur qu'il sert :
+      // sans ce contrôle, n'importe quel compte pouvait s'auto-attribuer le
+      // droit de scanner les billets d'un événement qui ne lui appartient pas.
+      if (name === 'StaffMember' && !_trusted) {
+        const user = requireUser()
+        if (data.organizer_email !== user.email) {
+          throw new ApiError("Tu ne peux ajouter du staff que pour ton propre profil organisateur", 403)
+        }
+      }
+      if (name === 'Payout' && !_trusted) {
+        const user = requireUser()
+        if (data.organizer_email !== user.email) {
+          throw new ApiError('Demande de versement invalide', 403)
+        }
+      }
       const item = {
         id: uid(), ...data,
         created_by: getSession()?.email || data.created_by || null,
         created_date: now(), updated_date: now(),
+      }
+      // Un profil organisateur se crée toujours en attente : sans ça, créer
+      // directement l'entité avec `status: 'approuve', is_verified: true`
+      // suffisait à shunter complètement la validation par un administrateur.
+      if (name === 'Organizer' && !_trusted) {
+        Object.assign(item, { status: 'en_attente', is_verified: false, total_events: 0, rating: 0 })
       }
       db[name].push(item)
       persist()
@@ -151,19 +190,37 @@ function entity(name) {
       for (const i of items) res.push(await this.create(i))
       return res
     },
-    async update(id, data) {
+    async update(id, data, _trusted = false) {
       load()
+      // Voie publique bloquée pour les collections sensibles : toute écriture
+      // doit transiter par `ops`/`auth`, qui appliquent les contrôles d'accès
+      // et de transition d'état (ex. valider un billet, approuver un compte).
+      if (LOCKED_COLLECTIONS.has(name) && !_trusted) {
+        throw new ApiError('Modification non autorisée par cette voie', 403)
+      }
       const idx = db[name].findIndex((i) => i.id === id)
       if (idx === -1) throw new ApiError(`${name} introuvable`, 404)
-      // Les secrets d'un compte ne se modifient que par le module d'authentification.
       const patch = { ...data }
       if (name === 'User') SECRET_USER_FIELDS.forEach((f) => delete patch[f])
+      if (!_trusted) (PROTECTED_FIELDS[name] || []).forEach((f) => delete patch[f])
       db[name][idx] = { ...db[name][idx], ...patch, updated_date: now() }
       persist()
       return out(db[name][idx])
     },
-    async delete(id) {
+    async delete(id, _trusted = false) {
       load()
+      // Cas particulier : un organisateur peut retirer SON staff par la voie
+      // publique (c'est la seule collection verrouillée où l'UI supprime
+      // directement), à condition d'en être bien le propriétaire.
+      if (name === 'StaffMember' && !_trusted) {
+        const user = requireUser()
+        const row = db[name].find((i) => i.id === id)
+        if (row && row.organizer_email !== user.email) {
+          throw new ApiError('Tu ne peux retirer que ton propre staff', 403)
+        }
+      } else if (LOCKED_COLLECTIONS.has(name) && !_trusted) {
+        throw new ApiError('Suppression non autorisée par cette voie', 403)
+      }
       db[name] = db[name].filter((i) => i.id !== id)
       persist()
       return true
@@ -199,6 +256,47 @@ function currentAccount() {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
 
+/**
+ * Ralentissement des tentatives de connexion par email, pour décourager le
+ * bourrinage de mot de passe depuis le formulaire. Protection client — un
+ * script qui vide `localStorage` la contourne — mais elle bloque l'attaque la
+ * plus probable : quelqu'un qui essaie des mots de passe à la main ou via un
+ * outil ne touchant que l'interface.
+ */
+const THROTTLE_KEY = 'kelbail_login_throttle_v1'
+const THROTTLE_THRESHOLD = 5
+const THROTTLE_BASE_MS = 30_000
+const THROTTLE_MAX_MS = 10 * 60_000
+
+function loadThrottle() {
+  try { return JSON.parse(localStorage.getItem(THROTTLE_KEY)) || {} } catch { return {} }
+}
+function saveThrottle(t) {
+  try { localStorage.setItem(THROTTLE_KEY, JSON.stringify(t)) } catch { /* quota dépassé */ }
+}
+function checkThrottle(email) {
+  const entry = loadThrottle()[email]
+  if (entry?.lockedUntil && entry.lockedUntil > Date.now()) {
+    const seconds = Math.ceil((entry.lockedUntil - Date.now()) / 1000)
+    throw new ApiError(`Trop de tentatives. Réessaie dans ${seconds}s.`, 429)
+  }
+}
+function recordLoginFailure(email) {
+  const table = loadThrottle()
+  const entry = table[email] || { count: 0 }
+  entry.count += 1
+  if (entry.count >= THROTTLE_THRESHOLD) {
+    const ms = Math.min(THROTTLE_BASE_MS * 2 ** (entry.count - THROTTLE_THRESHOLD), THROTTLE_MAX_MS)
+    entry.lockedUntil = Date.now() + ms
+  }
+  table[email] = entry
+  saveThrottle(table)
+}
+function clearLoginThrottle(email) {
+  const table = loadThrottle()
+  if (table[email]) { delete table[email]; saveThrottle(table) }
+}
+
 const auth = {
   isAuthenticated: () => !!currentAccount(),
 
@@ -211,10 +309,12 @@ const auth = {
   async login({ email, password }) {
     load(); await delay(120)
     const clean = String(email || '').trim().toLowerCase()
+    checkThrottle(clean)
     const account = raw('User').find((u) => u.email.toLowerCase() === clean && !u.deleted)
     // Message identique dans les deux cas : ne pas révéler quels emails existent.
     const ok = account && (await verifyPassword(password, account))
-    if (!ok) throw new ApiError('Email ou mot de passe incorrect', 401)
+    if (!ok) { recordLoginFailure(clean); throw new ApiError('Email ou mot de passe incorrect', 401) }
+    clearLoginThrottle(clean)
     setSession(account)
     return sanitize('User', account)
   },
@@ -322,7 +422,7 @@ const ops = {
    * Achat de billets. Vérifie le stock réel et le plafond par personne au
    * moment de l'écriture, et pas seulement dans l'interface.
    */
-  async purchase({ eventId, quantity, buyerName, operator, ussdCode }) {
+  async purchase({ eventId, quantity, buyerName, operator, ussdCode, paymentMethod = 'mobile_money', paymentToken }) {
     const user = requireUser()
     load()
     const event = raw('Event').find((e) => e.id === eventId)
@@ -345,11 +445,16 @@ const ops = {
       throw new ApiError(`Limite de ${MAX_TICKETS_PER_PERSON} billets par personne par événement dépassée.`)
     }
 
+    // `paymentToken` (Google Pay) ou `ussdCode` (Mobile Money) ne sont jamais
+    // vérifiés ici : comme il n'y a pas de serveur de paiement, la confirmation
+    // reste déclarative quel que soit le moyen choisi. Voir `src/lib/payments.js`.
     const ticket = await entities.Ticket.create({
       event_id: eventId, buyer_email: user.email, buyer_name: buyerName.trim(),
       quantity: qty, total_price: qty * event.ticket_price,
       ticket_code: `TKT-${randomToken(4).toUpperCase()}`,
-      payment_code: ussdCode, operator, status: 'en_attente',
+      payment_code: ussdCode, operator, payment_method: paymentMethod,
+      payment_token: paymentToken ? String(paymentToken).slice(0, 500) : undefined,
+      status: 'en_attente',
     })
     event.tickets_sold = (event.tickets_sold || 0) + qty
     event.updated_date = now()
@@ -393,16 +498,16 @@ const ops = {
     if (ticket.status === 'en_attente') {
       return { status: 'pending', ticket, message: 'En attente de confirmation de paiement' }
     }
-    await entities.Ticket.update(ticket.id, { status: 'utilise', used_at: now(), used_by: user.email })
+    await entities.Ticket.update(ticket.id, { status: 'utilise', used_at: now(), used_by: user.email }, true)
     return { status: 'valid', ticket, message: `${ticket.buyer_name} - Entrée autorisée ✓` }
   },
 
   /** Annulation d'un événement : billets annulés et acheteurs prévenus. */
   async cancelEvent(eventId) {
     const { event } = requireEventAccess(eventId, { staffAllowed: false })
-    await entities.Event.update(eventId, { status: 'annule' })
+    await entities.Event.update(eventId, { status: 'annule' }, true)
     const tickets = raw('Ticket').filter((t) => t.event_id === eventId && t.status !== 'annule')
-    for (const t of tickets) await entities.Ticket.update(t.id, { status: 'annule' })
+    for (const t of tickets) await entities.Ticket.update(t.id, { status: 'annule' }, true)
     const buyers = [...new Set(tickets.map((t) => t.buyer_email))]
     for (const email of buyers) {
       await notify(email, 'event_status_change', 'Événement annulé',
@@ -422,7 +527,7 @@ const ops = {
       throw new ApiError('La jauge ne peut pas être inférieure au nombre de billets déjà vendus')
     }
     const opened = next - (event.tickets_available || 0)
-    await entities.Event.update(eventId, { tickets_available: next })
+    await entities.Event.update(eventId, { tickets_available: next }, true)
     if (opened > 0) {
       const waiting = raw('Waitlist').filter((w) => w.event_id === eventId && !w.notified)
       for (const w of waiting) {
@@ -488,7 +593,7 @@ const ops = {
       organizer_name: data.organizer_name || organizer.company_name || user.full_name,
       status: 'actif', is_featured: false,
     })
-    await entities.Organizer.update(organizer.id, { total_events: (organizer.total_events || 0) + 1 })
+    await entities.Organizer.update(organizer.id, { total_events: (organizer.total_events || 0) + 1 }, true)
 
     const followers = raw('Follow').filter((f) => f.organizer_email === user.email)
     for (const f of followers) {
@@ -502,7 +607,7 @@ const ops = {
   /** Changement de statut d'un organisateur. Réservé aux administrateurs. */
   async setOrganizerStatus(organizerId, patch, message) {
     requireAdmin()
-    const organizer = await entities.Organizer.update(organizerId, patch)
+    const organizer = await entities.Organizer.update(organizerId, patch, true)
     if (message) {
       await notify(organizer.user_email, 'organizer', message.title, message.body, '/profil-organisateur')
     }
@@ -515,13 +620,13 @@ const ops = {
     load()
     const report = raw('FraudReport').find((r) => r.id === reportId)
     if (!report) throw new ApiError('Signalement introuvable', 404)
-    await entities.FraudReport.update(reportId, { status, admin_notes: adminNotes })
+    await entities.FraudReport.update(reportId, { status, admin_notes: adminNotes }, true)
     if (status === 'confirmed' && report.type === 'fake_organizer') {
       const event = raw('Event').find((e) => e.id === report.event_id)
       const organizer = raw('Organizer').find(
         (o) => o.id === report.organizer_id || (event && o.user_email === event.organizer_email),
       )
-      if (organizer) await entities.Organizer.update(organizer.id, { status: 'suspendu' })
+      if (organizer) await entities.Organizer.update(organizer.id, { status: 'suspendu' }, true)
     }
   },
 
@@ -580,7 +685,7 @@ const ops = {
       ...(newOwnerEmail ? { buyer_email: newOwnerEmail } : {}),
       transfer_history: history,
       // Regénérer le QR avec le même code (le code ne change pas, l'ID reste le même)
-    })
+    }, true)
     // Regénérer le QR pour invalider les captures de l'ancienne version
     await functions.invoke('sendTicketEmail', { ticketId })
     return { success: true }
@@ -623,7 +728,7 @@ const functions = {
     const wasPending = ticket.status === 'en_attente'
     await entities.Ticket.update(ticket.id, {
       qr_code_url, ...(wasPending ? { status: 'confirme' } : {}),
-    })
+    }, true)
     if (wasPending) {
       const event = raw('Event').find((e) => e.id === ticket.event_id)
       await notify(ticket.buyer_email, 'ticket_confirmation', 'Billet confirmé',
